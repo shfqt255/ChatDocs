@@ -132,7 +132,7 @@ Benefits:
 
 ---
 
-## 🔎 Semantic Search
+## Semantic Search
 
 Questions are converted into embeddings.
 
@@ -303,7 +303,7 @@ Generated Answer
 
 ---
 
-# 🛠 Technology Stack
+#  Technology Stack
 
 ## Frontend
 
@@ -380,7 +380,7 @@ ChatDocs
 
 ---
 
-# ⚙ Installation
+# Installation
 
 ## Clone Repository
 
@@ -567,7 +567,7 @@ This metadata is stored alongside every chunk inside Supabase.
 
 ---
 
-# ✂ Semantic Chunking
+# Semantic Chunking
 
 Instead of splitting text every fixed number of characters,
 
