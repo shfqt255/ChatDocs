@@ -1,16 +1,15 @@
 from supabase import Client, create_client
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 from langchain_mistralai import ChatMistralAI
-from langchain_google_genai import GoogleGenerativeAI
 from langchain_experimental.text_splitter import SemanticChunker
 from operator import itemgetter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
-from typing import List
+from typing import List, Optional
 from langchain_core.documents import Document
 from dotenv import load_dotenv
 import os
@@ -19,12 +18,28 @@ load_dotenv()
 
 TOP_K = 4
 
+# tracks in-progress/completed background uploads by doc_id, so /upload can
+# return immediately and the client can poll status separately instead of
+# holding one http request open for the entire ingestion (which is what
+# was causing 502s on large documents).
+UPLOAD_STATUS: dict[str, dict] = {}
+
+# the embedding model is loaded once, the first time it's needed, and reused
+# for every request after that - it is NOT rebuilt on every upload, chat, or
+# delete call. reloading bge on every request was the direct cause of the
+# repeated memory spikes / OOM crashes seen on railway.
+_embeddings_instance: Optional[HuggingFaceEmbeddings] = None
+
+
 def _create_supabase_client() -> Client:
     return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SECRET_KEY"))
 
 
 def _create_embeddings() -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
+    global _embeddings_instance
+    if _embeddings_instance is None:
+        _embeddings_instance = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    return _embeddings_instance
 
 def _create_vector_store() -> SupabaseVectorStore:
     return SupabaseVectorStore(
@@ -55,19 +70,42 @@ def _split_documents(docs: List[Document]) -> List[Document]:
     return splitter.split_documents(docs)
 
 
-def ingest_document(file_path:str, user_id: str, doc_id:str)-> int:
+def ingest_document(file_path:str, user_id: str, doc_id:str, original_filename: str | None = None)-> int:
 
     raw_docs= _load_file(file_path)
 
     for doc in raw_docs:
         doc.metadata["user_id"]= user_id
         doc.metadata["doc_id"]= doc_id
-        doc.metadata["filename"]= os.path.basename(file_path)
+        doc.metadata["filename"]= original_filename or os.path.basename(file_path)
 
     chunks= _split_documents(raw_docs)
     vector_store= _create_vector_store()
     vector_store.add_documents(chunks)
     return len(chunks)
+
+
+def ingest_document_background(file_path: str, user_id: str, doc_id: str, original_filename: str | None = None) -> None:
+    """
+    same work as ingest_document, but runs as a background task and writes
+    its outcome into UPLOAD_STATUS instead of returning it - this is what
+    lets /upload respond immediately instead of blocking on a large file's
+    entire chunking + embedding pass. the caller (app.py) polls
+    GET /upload/{doc_id}/status to find out when it's actually done.
+    the temp file is cleaned up here, once ingestion actually finishes,
+    since the request that created it has already returned by then.
+    """
+    UPLOAD_STATUS[doc_id] = {"state": "processing", "chunks": None, "error": None}
+    try:
+        chunks = ingest_document(file_path, user_id=user_id, doc_id=doc_id, original_filename=original_filename)
+        UPLOAD_STATUS[doc_id] = {"state": "done", "chunks": chunks, "error": None}
+    except Exception as exc:
+        UPLOAD_STATUS[doc_id] = {"state": "error", "chunks": None, "error": str(exc)}
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
 
 
@@ -80,6 +118,37 @@ def delete_document(doc_id: str, user_id: str) -> None:
         "metadata->>doc_id": doc_id,
         "metadata->>user_id": user_id,
     }).execute()
+
+
+def list_documents(user_id: str) -> List[dict]:
+    """
+    returns one entry per uploaded document (not per chunk), scoped to the
+    requesting user. a document may have many chunk rows in supabase, so
+    this groups by doc_id and reports the chunk count alongside each one.
+    """
+    client = _create_supabase_client()
+    response = (
+        client.table("documents")
+        .select("metadata")
+        .eq("metadata->>user_id", user_id)
+        .execute()
+    )
+
+    grouped: dict[str, dict] = {}
+    for row in response.data or []:
+        metadata = row.get("metadata") or {}
+        doc_id = metadata.get("doc_id")
+        if not doc_id:
+            continue
+        if doc_id not in grouped:
+            grouped[doc_id] = {
+                "doc_id": doc_id,
+                "filename": metadata.get("filename", "unknown"),
+                "chunk_count": 0,
+            }
+        grouped[doc_id]["chunk_count"] += 1
+
+    return list(grouped.values())
 
 def _build_llm_candidates() -> List[tuple]:
     return [
@@ -139,7 +208,7 @@ question:
 {question}
 """)
 
-def build_rag_chain(user_id: str):
+def build_rag_chain(user_id: str, doc_id: str):
 
     vector_store = _create_vector_store()
 
@@ -148,6 +217,7 @@ def build_rag_chain(user_id: str):
             "k": TOP_K,
             "filter": {
                 "user_id": user_id,
+                "doc_id": doc_id,
             },
         }
     )
@@ -297,3 +367,68 @@ def query(chain, question: str) -> dict:
         "provider": result["provider"],
         "sources": sources,
     }
+
+
+def get_or_create_thread(user_id: str, doc_id: str, filename: str) -> str:
+    """
+    each document has exactly one ongoing conversation per user. returns
+    the existing thread id if one exists, otherwise creates one.
+    """
+    client = _create_supabase_client()
+    existing = (
+        client.table("chat_threads")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("doc_id", doc_id)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        return existing.data[0]["id"]
+
+    created = (
+        client.table("chat_threads")
+        .insert({"user_id": user_id, "doc_id": doc_id, "filename": filename})
+        .execute()
+    )
+    return created.data[0]["id"]
+
+
+def save_message(thread_id: str, role: str, content: str, provider: str | None = None, sources: list | None = None) -> None:
+    client = _create_supabase_client()
+    client.table("chat_messages").insert({
+        "thread_id": thread_id,
+        "role": role,
+        "content": content,
+        "provider": provider,
+        "sources": sources,
+    }).execute()
+
+
+def get_thread_messages(user_id: str, doc_id: str) -> list[dict]:
+    """
+    returns every message in this user's conversation for one document,
+    oldest first. returns an empty list if no conversation exists yet -
+    that's a normal state, not an error.
+    """
+    client = _create_supabase_client()
+    thread = (
+        client.table("chat_threads")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("doc_id", doc_id)
+        .limit(1)
+        .execute()
+    )
+    if not thread.data:
+        return []
+
+    thread_id = thread.data[0]["id"]
+    messages = (
+        client.table("chat_messages")
+        .select("role, content, provider, sources, created_at")
+        .eq("thread_id", thread_id)
+        .order("created_at")
+        .execute()
+    )
+    return messages.data or []
