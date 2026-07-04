@@ -1546,9 +1546,7 @@ git push origin feature/new-feature
 
 #  License
 
-This project is released under the **MIT License**.
-
-Feel free to use, modify, and distribute it in accordance with the license terms.
+Feel free to use, modify, and distribute.
 
 ---
 
